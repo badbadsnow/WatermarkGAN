@@ -752,7 +752,8 @@ class AudioSealDetector(torch.nn.Module):
             activation=self.seanet_configs.get("activation"),
             activation_params=self.seanet_configs.get("activation_params"),
             causal=self.seanet_configs.get("causal"),
-            channels=self.seanet_configs.get("channels"),
+            # channels=self.seanet_configs.get("channels"),
+            channels=1,
             compress=self.seanet_configs.get("compress"),
             dilation_base=self.seanet_configs.get("dilation_base"),
             dimension=self.seanet_configs.get("dimension"),
@@ -794,9 +795,9 @@ class AudioSealDetector(torch.nn.Module):
         detected = (
                 torch.count_nonzero(torch.gt(result[:, 1, :], 0.5)) / result.shape[-1]
         )
-        # detect_prob = detected.cpu().item()  # type: ignore
+        detect_prob = detected.cpu().item()  # type: ignore
         message = torch.gt(message, message_threshold).long()
-        return detected, message
+        return detect_prob, message
 
     def decode_message(self, result: torch.Tensor) -> torch.Tensor:
         """

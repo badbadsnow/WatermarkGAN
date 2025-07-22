@@ -3,6 +3,8 @@ import warnings
 warnings.simplefilter(action="ignore", category=FutureWarning)
 import itertools
 import os
+
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 import time
 import argparse
 import json
@@ -42,6 +44,7 @@ from utils import (
     load_checkpoint,
     save_checkpoint,
     save_audio,
+    calculate_metrics
 )
 import torchaudio as ta
 from pesq import pesq
@@ -292,10 +295,11 @@ def train(rank, a, h):
         val_pesq_tot = 0
         val_mrstft_tot = 0
 
-        wm_detect_acc_tot = 0.0  # 水印存在准确率累加
+        all_true_wm = []
+        all_pred_wm = []
         wm_content_sim_tot = 0.0  # 内容相似度累加
-        wm_content_bit_acc_tot = 0.0  # 比特准确率累加
-        total_samples = len(loader)  # 总样本数计数器
+        wm_content_bitacc_tot = 0.0  # 比特准确率累加
+        wm_samples = 0
 
         # Modules for evaluation metrics
         pesq_resampler = ta.transforms.Resample(h.sampling_rate, 16000).cuda()
@@ -318,15 +322,21 @@ def train(rank, a, h):
             for j, batch in enumerate(tqdm(loader)):
                 x, y, _, y_mel = batch
                 y = y.to(device)
-                # 生成随机水印
-                message = torch.randint(
-                    0, 2, (x.shape[0], h.get("nbits")), device=device
-                )
+
+                if torch.rand(1) > h.message_p:
+                    is_watermarked = True
+                    message = torch.randint(0, 2, (x.shape[0], h.get("nbits")), device=device)
+                    all_true_wm.append(1)
+                else:
+                    is_watermarked = False
+                    message = torch.zeros(x.shape[0], h.get("nbits"), device=device)
+                    all_true_wm.append(0)
 
                 if hasattr(generator, "module"):
                     y_g_hat = generator.module(x.to(device), message)
                 else:
                     y_g_hat = generator(x.to(device), message)
+
                 y_mel = y_mel.to(device, non_blocking=True)
                 y_g_hat_mel = mel_spectrogram(
                     y_g_hat.squeeze(1),
@@ -346,21 +356,15 @@ def train(rank, a, h):
                 else:
                     detect_result, detect_message = wmd.detect_watermark(y_g_hat)
 
-                detect_pred = (detect_result > 0.5).float().item()
-                wm_detect_acc_tot += detect_pred
+                all_pred_wm.append(detect_result)
 
-                # 内容相似度
-                cos_similarity = F.cosine_similarity(detect_message.float(), message.float(), dim=1).mean().item()
-                wm_content_sim_tot += cos_similarity
-                bit_accuracy = (detect_message == message).float().mean().item()
-                wm_content_bit_acc_tot += bit_accuracy
-
-                # 保存水印验证结果
-                # with open(os.path.join(a.checkpoint_path, f'{mode}{steps:08d}'+'.txt'), "w") as wm_results_file:
-                #     wm_results_file.write(
-                #         f"{j}\t{detect_result:.4f}\t{cos_similarity:.4f}\t{bit_accuracy:.4f}\t"
-                #         f"{message[0, :4].cpu().numpy()}\t{detect_message[0, :4].cpu().numpy()}\n"
-                #     )
+                if is_watermarked:
+                    wm_samples += 1
+                    # 内容相似度
+                    cos_similarity = F.cosine_similarity(detect_message.float(), message.float(), dim=1).mean().item()
+                    wm_content_sim_tot += cos_similarity
+                    bit_accuracy = (detect_message == message).float().mean().item()
+                    wm_content_bitacc_tot += bit_accuracy
 
                 # PESQ calculation. only evaluate PESQ if it's speech signal (nonspeech PESQ will error out)
                 if (
@@ -456,24 +460,30 @@ def train(rank, a, h):
             val_err = val_err_tot / (j + 1)
             val_pesq = val_pesq_tot / (j + 1)
             val_mrstft = val_mrstft_tot / (j + 1)
-            # Log evaluation metrics to Tensorboard
             sw.add_scalar(f"validation_{mode}/mel_spec_error", val_err, steps)
             sw.add_scalar(f"validation_{mode}/pesq", val_pesq, steps)
             sw.add_scalar(f"validation_{mode}/mrstft", val_mrstft, steps)
 
             # 水印指标
-            wm_detect_acc_avg = wm_detect_acc_tot / (j + 1)
-            wm_content_sim_avg = wm_content_sim_tot / (j + 1)
-            wm_content_bit_acc_avg = wm_content_bit_acc_tot / (j + 1)
-            sw.add_scalar(f"validation_{mode}/wm_detection_accuracy", wm_detect_acc_avg, steps)
-            sw.add_scalar(f"validation_{mode}/wm_content_similarity", wm_content_sim_avg, steps)
-            sw.add_scalar(f"validation_{mode}/wm_bit_accuracy", wm_content_bit_acc_avg, steps)
+            acc, tpr, fpr, auc = calculate_metrics(true=all_true_wm, pred=all_pred_wm)
+            wm_content_sim = wm_content_sim_tot / wm_samples
+            wm_content_bitacc = wm_content_bitacc_tot / wm_samples
+            sw.add_scalar(f"validation_{mode}/wm_acc", acc, steps)
+            sw.add_scalar(f"validation_{mode}/wm_tpr", tpr, steps)
+            sw.add_scalar(f"validation_{mode}/wm_fpr", fpr, steps)
+            sw.add_scalar(f"validation_{mode}/wm_auc", auc, steps)
+            sw.add_scalar(f"validation_{mode}/wm_content_similarity", wm_content_sim, steps)
+            sw.add_scalar(f"validation_{mode}/wm_bit_accuracy", wm_content_bitacc, steps)
 
             # 打印结果
             print(
-                f"Watermark Verification ({mode} - {(j + 1)} samples): Detection Accuracy: "
-                f"{wm_detect_acc_avg:.4f} Content Similarity: {wm_content_sim_avg:.4f}"
-                f"Bit Accuracy: {wm_content_bit_acc_avg:.4f}"
+                f"Watermark Verification ({mode} - {(j + 1)} samples): "
+                f"Acc: {acc:.4f}"
+                f"Tpr: {tpr:.4f}"
+                f"Fpr: {fpr:.4f}"
+                f"Auc: {auc:.4f}"
+                f"Similarity: {wm_content_sim:.4f}"
+                f"BitAcc: {wm_content_bitacc:.4f}"
             )
 
         generator.train()
@@ -525,9 +535,13 @@ def train(rank, a, h):
             y = y.unsqueeze(1)
 
             # message shape=[batch,nbits]
-            message = torch.randint(
-                0, 2, (x.shape[0], h.get("nbits")), device=x.device
-            )
+            if torch.rand(1) > h.message_p:
+                is_watermarked = 1.0
+                message = torch.randint(0, 2, (x.shape[0], h.get("nbits")), device=device)
+            else:
+                is_watermarked = 0.0
+                message = torch.zeros(x.shape[0], h.get("nbits"), device=device)
+
             y_g_hat = generator(x, message)
 
             y_g_hat_mel = mel_spectrogram(
@@ -564,12 +578,10 @@ def train(rank, a, h):
             )
 
             # WMD
-            pred_prob, message_prob = wmd(y_g_hat.detach())  # (torch.Size([2, 2, 5461]), torch.Size([2, 16]))
-            # pred_prob[:, 0, :]=torch.Size([2, 5461]) 对应于负概率，pred_prob[:, 1, :]=torch.Size([2, 5461]) 对应于正概率。
-            # d_result, d_message = wmd.detect_watermark(y_g_hat)  # (torch.Size([]), torch.Size([2, 16])) 01
-            masked_loss = masked_detection_loss(pred_prob, is_watermarked=True)
-            dec_loss = decoding_loss(message_prob, message)
-            wm_loss = (masked_loss + dec_loss) * 200
+            pred_prob, _ = wmd(y_g_hat.detach())  # (torch.Size([]), torch.Size([2, 16])) 01
+            # wmd.forward = pred_prob[:, 0, :]=torch.Size([2, 5461]) 对应于负概率，pred_prob[:, 1, :]=torch.Size([2, 5461]) 对应于正概率。
+            target = torch.full_like(pred_prob[:, 1, :], is_watermarked)  # 正类平均概率
+            wm_loss = F.binary_cross_entropy(pred_prob[:, 1, :], target) * 10
 
             loss_disc_all = loss_disc_s + loss_disc_f + wm_loss
 
@@ -620,13 +632,17 @@ def train(rank, a, h):
             loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
             loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
 
-            # 水印对抗损失
-            loudness_loss = tf_loudness_loss(y, y_g_hat)
-            generator_wm_loss = loudness_loss * 100
+            # 水印损失
+            pred_prob, pred_message = wmd(y_g_hat)
+            # wmd.forward = pred_prob[:, 0, :]=torch.Size([2, 5461]) 对应于负概率，pred_prob[:, 1, :]=torch.Size([2, 5461]) 对应于正概率。
+            adv_loss = -torch.log(pred_prob[:, 0, :].mean()) * 0.5
+            dec_loss = decoding_loss(pred_message, message)
+            loudness_loss = tf_loudness_loss(y, y_g_hat) * 200
+            wm_g_loss = loudness_loss + adv_loss + dec_loss
 
             if steps >= a.freeze_step:
                 loss_gen_all = (
-                        loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel + generator_wm_loss
+                        loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel + wm_g_loss
                 )
             else:
                 print(
@@ -640,6 +656,22 @@ def train(rank, a, h):
             )
             optim_g.step()
             # 生成器训练结束--------------------------------------------------------------------------------------------------------------------------------------------------
+
+            # for name, param in wmd.named_parameters():
+            #     if param.requires_grad and param.grad is None:
+            #         print(f"wmd[WARNING] No gradient: {name}")
+            #
+            # for name, param in mrd.named_parameters():
+            #     if param.requires_grad and param.grad is None:
+            #         print(f"mrd[WARNING] No gradient: {name}")
+            #
+            # for name, param in mpd.named_parameters():
+            #     if param.requires_grad and param.grad is None:
+            #         print(f"mpd[WARNING] No gradient: {name}")
+            #
+            # for name, param in generator.named_parameters():
+            #     if param.requires_grad and param.grad is None:
+            #         print(f"generator[WARNING] No gradient: {name}")
 
             if rank == 0:
                 # STDOUT logging
@@ -706,7 +738,7 @@ def train(rank, a, h):
 
                     # watermark
                     sw.add_scalar("training/grad_norm_wmd", grad_norm_wmd, steps)
-                    sw.add_scalar("training/masked_loss", masked_loss, steps)
+                    sw.add_scalar("training/adv_loss", adv_loss, steps)
                     sw.add_scalar("training/dec_loss", dec_loss, steps)
                     sw.add_scalar("training/loudness_loss", loudness_loss, steps)
                     sw.add_scalar("training/wm_loss", wm_loss, steps)
@@ -780,12 +812,12 @@ def main():
         default=["D:/dataset/LibriTTS/dev-clean.txt", "D:/dataset/LibriTTS/dev-other.txt"],
     )
     parser.add_argument("--checkpoint_path", default="exp/wmgan")
-    parser.add_argument("--config", default="configs/wmgan_base_24khz_100band.json")
-    parser.add_argument("--training_epochs", default=500, type=int)
-    parser.add_argument("--stdout_interval", default=20, type=int)
-    parser.add_argument("--checkpoint_interval", default=2000, type=int)
-    parser.add_argument("--summary_interval", default=200, type=int)
-    parser.add_argument("--validation_interval", default=2000, type=int)
+    parser.add_argument("--config", default="configs/baseline_base_24khz_100band.json")
+    parser.add_argument("--training_epochs", default=20, type=int)
+    parser.add_argument("--stdout_interval", default=2, type=int)
+    parser.add_argument("--checkpoint_interval", default=2, type=int)
+    parser.add_argument("--summary_interval", default=2, type=int)
+    parser.add_argument("--validation_interval", default=2, type=int)
     parser.add_argument(
         "--freeze_step",
         default=0,

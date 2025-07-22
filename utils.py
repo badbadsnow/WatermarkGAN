@@ -97,3 +97,47 @@ def save_audio(audio, path, sr):
     audio = audio * MAX_WAV_VALUE
     audio = audio.cpu().numpy().astype("int16")
     write(path, sr, audio)
+
+
+def calculate_metrics(true, pred):
+    # 转换为Tensor
+    tl = torch.tensor(true)
+    pp = torch.tensor(pred)
+
+    # 计算混淆矩阵
+    pred_labels = (pp > 0.5).int()
+    tp = ((pred_labels == 1) & (tl == 1)).sum().item()
+    tn = ((pred_labels == 0) & (tl == 0)).sum().item()
+    fp = ((pred_labels == 1) & (tl == 0)).sum().item()
+    fn = ((pred_labels == 0) & (tl == 1)).sum().item()
+
+    # 基础指标
+    acc = (tp + tn) / len(tl)
+    tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+
+    # AUC计算（基于排序）
+    sorted_indices = torch.argsort(pp, descending=True)
+    sorted_labels = tl[sorted_indices]
+
+    tpr_points, fpr_points = [], []
+    tp_count, fp_count = 0, 0
+    num_pos = tl.sum().item()
+    num_neg = len(tl) - num_pos
+
+    for i in range(len(sorted_labels)):
+        if sorted_labels[i] == 1:
+            tp_count += 1
+        else:
+            fp_count += 1
+        tpr_points.append(tp_count / num_pos)
+        fpr_points.append(fp_count / num_neg)
+
+    # 梯形法积分
+    auc = 0.0
+    for i in range(1, len(fpr_points)):
+        dx = fpr_points[i] - fpr_points[i - 1]
+        y_avg = (tpr_points[i] + tpr_points[i - 1]) / 2
+        auc += dx * y_avg
+
+    return acc, tpr, fpr, auc

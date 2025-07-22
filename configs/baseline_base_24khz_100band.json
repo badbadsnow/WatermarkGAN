@@ -1,11 +1,12 @@
 {
     "output_dim": 32,
     "nbits": 16,
+    "message_p": 0.5,
     "seanet": {
         "activation": "ELU",
             "activation_params": {"alpha": 1.0},
         "causal": false,
-        "channels": 1,
+        "channels": 256,
         "compress": 2,
         "dilation_base": 2,
         "dimension": 128,
@@ -27,18 +28,6 @@
         "final_activation_params": null,
         "trim_right_ratio": 1.0
     },
-
-    "feat_dim": 256,
-    "win_sec": 0.05,
-    "scale_factors": [0.1, 0.2, 0.3],
-    "conv_channels": 64,
-    "attn_dim": 128,
-    "dropout_rate": 0.3,
-    "wm_d_weigh": 0.1,
-    "wm_g_weigh": 0.2,
-    "aug_strength": 0.05,
-    "use_spec": false,
-
 
     "resblock": "1",
     "num_gpus": 0,

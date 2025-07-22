@@ -253,40 +253,6 @@ def generator_loss(
     return loss, gen_losses
 
 
-def masked_detection_loss(pred_prob, is_watermarked=True):
-    """
-    掩蔽样本级检测损失 (公式3)
-
-    参数:
-        pred_prob (Tensor): 检测器输出的概率分布 [batch, 2, T]
-        is_watermarked (bool): 音频是否包含水印
-
-    返回:
-        Tensor: 损失值
-    """
-    batch_size, _, T = pred_prob.shape
-
-    # 提取有水印的概率 (第2维索引1)
-    detection_probs = pred_prob[:, 1, :]  # [batch, T]
-
-    # 创建标签 (所有时间步)
-    if is_watermarked:
-        labels = torch.ones_like(detection_probs)  # [batch, T]
-    else:
-        labels = torch.zeros_like(detection_probs)  # [batch, T]
-
-    # 计算每个时间步的二元交叉熵 (公式3)
-    bce_per_timestep = F.binary_cross_entropy(
-        detection_probs,
-        labels,
-        reduction='none'
-    )
-
-    # 平均所有时间步: (1/T) * Σ BCE
-    loss_per_sample = torch.mean(bce_per_timestep, dim=1)  # [batch]
-    return torch.mean(loss_per_sample)  # 标量
-
-
 def decoding_loss(message_prob, original_message):
     """
     多比特水印解码损失
@@ -380,12 +346,12 @@ def tf_loudness_loss(original_audio, watermarked_audio,
         s_segments = s_band.unfold(-1, window_size, hop_length)
         d_segments = d_band.unfold(-1, window_size, hop_length)
 
-        # 计算响度 (公式1)
+        # 计算响度
         L_s = torch.sqrt(torch.mean(s_segments ** 2, dim=-1))
         L_phi = torch.sqrt(torch.mean(d_segments ** 2, dim=-1))
         l_b_w = L_phi - L_s
 
-        # 应用softmax加权 (公式2)
+        # 应用softmax加权
         weights = F.softmax(l_b_w, dim=1)
         band_loss = torch.mean(weights * l_b_w)
 

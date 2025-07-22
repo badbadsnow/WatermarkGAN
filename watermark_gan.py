@@ -479,7 +479,7 @@ class BigVGAN_Watermark(torch.nn.Module, ):
         return model
 
 
-class BigVGAN_AudioSeal(torch.nn.Module, ):
+class BigVGAN_AudioSeal(torch.nn.Module):
     def __init__(self, h: AttrDict, use_cuda_kernel: bool = False):
         super().__init__()
         self.h = h
@@ -580,47 +580,78 @@ class BigVGAN_AudioSeal(torch.nn.Module, ):
         self.wm_alpha = torch.tensor(1)
         self.seanet_configs = h.get("seanet")
         self.decoder_configs = h.get("decoder")
-        self.msg_processor = MsgProcessor(
-            nbits=h.get("nbits", 16),
-            hidden_size=self.seanet_configs.get("dimension", 128))
-        self.wm_encoder = SEANetEncoder(
-            activation=self.seanet_configs.get("activation"),
-            activation_params=self.seanet_configs.get("activation_params"),
-            causal=self.seanet_configs.get("causal"),
-            channels=self.seanet_configs.get("channels"),
-            compress=self.seanet_configs.get("compress"),
-            dilation_base=self.seanet_configs.get("dilation_base"),
-            dimension=self.seanet_configs.get("dimension"),
-            disable_norm_outer_blocks=self.seanet_configs.get(
-                "disable_norm_outer_blocks"),
-            kernel_size=self.seanet_configs.get("kernel_size"),
-            last_kernel_size=self.seanet_configs.get("last_kernel_size"),
-            lstm=self.seanet_configs.get("lstm"),
-            n_filters=self.seanet_configs.get("n_filters"),
-            n_residual_layers=self.seanet_configs.get("n_residual_layers"),
-            norm=self.seanet_configs.get("norm"),
-            norm_params=self.seanet_configs.get("norm_params"),
-            pad_mode=self.seanet_configs.get("pad_mode"),
-            ratios=self.seanet_configs.get("ratios"),
-            residual_kernel_size=self.seanet_configs.get("residual_kernel_size"),
-            true_skip=self.seanet_configs.get("true_skip"),
-        )
-        self.wm_decoder = SEANetDecoder(
-            final_activation=self.decoder_configs.get("final_activation"),
-            final_activation_params=self.decoder_configs.get(
-                "final_activation_params"),
-            trim_right_ratio=self.decoder_configs.get("trim_right_ratio"),
-        )
+        self.wm_encoders = nn.ModuleList()
+        self.msg_processors = nn.ModuleList()
+        self.wm_decoders = nn.ModuleList()
+        for i in range(len(self.ups)):
+            ch = h.upsample_initial_channel // (2 ** (i + 1))
+            self.wm_encoders.append(
+                SEANetEncoder(
+                    activation=self.seanet_configs.get("activation"),
+                    activation_params=self.seanet_configs.get("activation_params"),
+                    causal=self.seanet_configs.get("causal"),
+                    channels=ch,
+                    compress=self.seanet_configs.get("compress"),
+                    dilation_base=self.seanet_configs.get("dilation_base"),
+                    dimension=ch // 2,
+                    disable_norm_outer_blocks=self.seanet_configs.get(
+                        "disable_norm_outer_blocks"),
+                    kernel_size=self.seanet_configs.get("kernel_size"),
+                    last_kernel_size=self.seanet_configs.get("last_kernel_size"),
+                    lstm=self.seanet_configs.get("lstm"),
+                    n_filters=self.seanet_configs.get("n_filters"),
+                    n_residual_layers=self.seanet_configs.get("n_residual_layers"),
+                    norm=self.seanet_configs.get("norm"),
+                    norm_params=self.seanet_configs.get("norm_params"),
+                    pad_mode=self.seanet_configs.get("pad_mode"),
+                    ratios=self.seanet_configs.get("ratios"),
+                    residual_kernel_size=self.seanet_configs.get("residual_kernel_size"),
+                    true_skip=self.seanet_configs.get("true_skip"),
+                )
+            )
+            self.msg_processors.append(
+                MsgProcessor(nbits=h.get("nbits", 16), hidden_size=ch // 2)
+            )
+            self.wm_decoders.append(
+                SEANetDecoder(
+                    final_activation=self.decoder_configs.get("final_activation"),
+                    final_activation_params=self.decoder_configs.get(
+                        "final_activation_params"),
+                    trim_right_ratio=self.decoder_configs.get("trim_right_ratio"),
+                    dimension=ch // 2
+                )
+            )
 
-    def forward(self, x, message=None):
+    def forward(self, x, message):
+        '''
+        Args:
+            x: torch.Size([b, 100, 32]) mel
+            message: torch.Size([b, 1, nbits])
+        Returns:
+            wav=torch.Size([b, 1, 8192])
+        '''
+
         # Pre-conv
-        x = self.conv_pre(x)
+        x = self.conv_pre(x)  # torch.Size([2, 512, 32])
 
         for i in range(self.num_upsamples):
             # Upsampling
             for i_up in range(len(self.ups[i])):
                 x = self.ups[i][i_up](x)
-                #
+            # torch.Size([2, 256, 256]) torch.Size([2, 128, 2048])  torch.Size([2, 64, 4096])   torch.Size([2, 32, 8192])
+
+            # Watermark
+            length = x.size(-1)
+            hidden = self.wm_encoders[i](x)
+            # torch.Size([2, 128, 1])   torch.Size([2, 16, 26])     torch.Size([2, 32, 13])     torch.Size([2, 16, 26])
+
+            hidden = self.msg_processors[i](hidden, message.to(device=hidden.device))
+            # torch.Size([2, 128, 1])   torch.Size([2, 64, 7])      torch.Size([2, 32, 13])     torch.Size([2, 16, 26])
+
+            watermark = self.wm_decoders[i](hidden)[..., :length]
+            # torch.Size([2, 1, 256])   torch.Size([2, 1, 2048])    torch.Size([2, 1, 4096])    torch.Size([2, 1, 8192])
+            x = x + watermark
+
             # AMP blocks
             xs = None
             for j in range(self.num_kernels):
@@ -639,33 +670,7 @@ class BigVGAN_AudioSeal(torch.nn.Module, ):
             x = torch.tanh(x)
         else:
             x = torch.clamp(x, min=-1.0, max=1.0)  # Bound the output to [-1, 1]
-
-        # x is wav=torch.Size([2, 1, 8192])
-        wm = self.get_watermark(x, message=message)
-        wm_x = x + self.wm_alpha * wm
-        return wm_x
-
-    def get_watermark(self, x, message):
-        length = x.size(-1)
-        if self.sampling_rate != 16000:
-            x = julius.resample_frac(x, old_sr=self.sampling_rate, new_sr=16000)
-        hidden = self.wm_encoder(x)  # torch.Size([1, 1, 16640]) to torch.Size([1, 128, 52])
-
-        if message is None:
-            message = torch.randint(
-                0, 2, (x.shape[0], self.msg_processor.nbits), device=x.device
-            )
-        else:
-            message = message.to(device=x.device)
-
-        hidden = self.msg_processor(hidden, message)
-        watermark = self.wm_decoder(hidden)  # torch.Size([1, 1, 16640])
-        if self.sampling_rate != 16000:
-            watermark = julius.resample_frac(
-                watermark, old_sr=16000, new_sr=self.sampling_rate
-            )
-
-        return watermark[..., :length]  # trim output cf encodec codebase
+        return x
 
     def remove_weight_norm(self):
         try:
@@ -754,8 +759,13 @@ class BigVGAN_AudioSeal(torch.nn.Module, ):
         return model
 
 
-with open('configs/baseline_base_24khz_100band.json') as f:
-    data = f.read()
-json_config = json.loads(data)
-h = AttrDict(json_config)
-m = BigVGAN_AudioSeal(h)
+# with open('configs/baseline_base_24khz_100band.json') as f:
+#     data = f.read()
+# json_config = json.loads(data)
+# h = AttrDict(json_config)
+# m = BigVGAN_AudioSeal(h)
+# x = torch.randn([2, 100, 32])
+# message = torch.randint(0, 2, (2, 16))
+# y = m(x, message)
+# print(x.shape, message.shape, y.shape)
+# pass
