@@ -753,7 +753,7 @@ class AudioSealDetector(torch.nn.Module):
             activation_params=self.seanet_configs.get("activation_params"),
             causal=self.seanet_configs.get("causal"),
             # channels=self.seanet_configs.get("channels"),
-            channels=1,
+            channels=self.output_dim,
             compress=self.seanet_configs.get("compress"),
             dilation_base=self.seanet_configs.get("dilation_base"),
             dimension=self.seanet_configs.get("dimension"),
@@ -772,8 +772,9 @@ class AudioSealDetector(torch.nn.Module):
             true_skip=self.seanet_configs.get("true_skip"),
             output_dim=self.output_dim,
         )
+        first_layer = torch.nn.Conv1d(1, encoder.output_dim, 1)
         last_layer = torch.nn.Conv1d(encoder.output_dim, 2 + self.nbits, 1)
-        self.detector = torch.nn.Sequential(encoder, last_layer)
+        self.detector = torch.nn.Sequential(first_layer, encoder, last_layer)
 
     def detect_watermark(
             self,

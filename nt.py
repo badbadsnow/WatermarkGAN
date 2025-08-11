@@ -3,8 +3,6 @@ import warnings
 warnings.simplefilter(action="ignore", category=FutureWarning)
 import itertools
 import os
-
-os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
 import time
 import argparse
 import json
@@ -15,16 +13,15 @@ from torch.utils.data import DistributedSampler, DataLoader
 import torch.multiprocessing as mp
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
-
 from env import AttrDict, build_env
 from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist, MAX_WAV_VALUE
-from watermark_gan import BigVGAN_AudioSeal, BigVGAN_AudioSeal_beforeUp512, BigVGAN_AudioSeal_afterUp32, BigVGAN_AudioSeal_withUp
+
+from watermark_gan import WmBigVGAN
 from discriminators import (
     MultiPeriodDiscriminator,
     MultiResolutionDiscriminator,
     MultiBandDiscriminator,
     MultiScaleSubbandCQTDiscriminator,
-    WatermarkDetector,
     AudioSealDetector,
 )
 from loss import (
@@ -35,7 +32,6 @@ from loss import (
     tf_loudness_loss,
     decoding_loss,
 )
-
 from utils import (
     plot_spectrogram,
     plot_spectrogram_clipped,
@@ -52,6 +48,7 @@ import auraloss
 
 torch.backends.cudnn.benchmark = False
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
 def train(rank, a, h):
     if h.num_gpus > 1:
@@ -69,12 +66,9 @@ def train(rank, a, h):
     device = torch.device(f"cuda:{rank:d}")
 
     # Define generator
-    # generator = BigVGAN_AudioSeal(h).to(device)
-    # generator = BigVGAN_AudioSeal_afterUp32(h).to(device)
-    # generator = BigVGAN_AudioSeal_beforeUp512(h).to(device)
-    generator = BigVGAN_AudioSeal_withUp(h).to(device)
+    generator = WmBigVGAN(h).to(device)
 
-    # WaterWarker
+    # WaterWarkerDetector
     wmd = AudioSealDetector(h).to(device)
 
     # Define discriminators. MPD is used by default
@@ -116,7 +110,7 @@ def train(rank, a, h):
         print(f"Generator params: {sum(p.numel() for p in generator.parameters())}")
         print(f"Discriminator mpd params: {sum(p.numel() for p in mpd.parameters())}")
         print(f"Discriminator mrd params: {sum(p.numel() for p in mrd.parameters())}")
-        print(f"Discriminator wmd params: {sum(p.numel() for p in wmd.parameters())}")
+        print(f"wm_detector params: {sum(p.numel() for p in wmd.parameters())}")
         os.makedirs(a.checkpoint_path, exist_ok=True)
         print(f"Checkpoints directory: {a.checkpoint_path}")
 
@@ -538,10 +532,10 @@ def train(rank, a, h):
 
             # message shape=[batch,nbits]
             if torch.rand(1) > h.message_p:
-                is_watermarked = 1.0
+                is_watermarked = True
                 message = torch.randint(0, 2, (x.shape[0], h.get("nbits")), device=device)
             else:
-                is_watermarked = 0.0
+                is_watermarked = False
                 message = torch.zeros(x.shape[0], h.get("nbits"), device=device)
 
             y_g_hat = generator(x, message)
@@ -579,14 +573,22 @@ def train(rank, a, h):
                 y_ds_hat_r, y_ds_hat_g
             )
 
-            # WMD
-            # pred_prob, _ = wmd(y_g_hat.detach())  # (torch.Size([]), torch.Size([2, 16])) 01
-            # # wmd.forward = pred_prob[:, 0, :]=torch.Size([2, 5461]) 对应于负概率，pred_prob[:, 1, :]=torch.Size([2, 5461]) 对应于正概率。
-            # target = torch.full_like(pred_prob[:, 1, :], is_watermarked)  # 正类平均概率
-            # wm_loss = F.binary_cross_entropy(pred_prob[:, 1, :], target) * 10
-
-            # loss_disc_all = loss_disc_s + loss_disc_f + wm_loss
             loss_disc_all = loss_disc_s + loss_disc_f
+
+            # WMD
+            # pred_prob, pred_message = wmd(y_g_hat.detach())  # (torch.Size([]), torch.Size([2, 16])) 01
+            # 真实样本无水印
+            # real_pred_prob, _ = wmd(y)
+            # target_real = torch.zeros_like(real_pred_prob[:, 1])  # 真实样本应预测无水印
+            # wm_loss_real = F.binary_cross_entropy(real_pred_prob[:, 1], target_real)
+            # # 生成样本：根据是否含水印设置标签
+            # gen_pred_prob, gen_pred_msg = wmd(y_g_hat.detach())
+            # target_gen = torch.full_like(gen_pred_prob[:, 1], float(is_watermarked))
+            # wm_loss_gen = F.binary_cross_entropy(gen_pred_prob[:, 1], target_gen)
+            # # 仅在水印样本计算解码损失
+            # dec_loss_gen = decoding_loss(gen_pred_msg, message) * is_watermarked * 10
+            # # 总判别器损失 = 原有损失 + 水印检测损失 + 解码损失
+            # loss_disc_all += wm_loss_real + wm_loss_gen + dec_loss_gen
 
             # Set clip_grad_norm value
             clip_grad_norm = h.get("clip_grad_norm", 1000.0)  # Default to 1000
@@ -638,10 +640,14 @@ def train(rank, a, h):
             # 水印损失
             pred_prob, pred_message = wmd(y_g_hat)
             # wmd.forward = pred_prob[:, 0, :]=torch.Size([2, 5461]) 对应于负概率，pred_prob[:, 1, :]=torch.Size([2, 5461]) 对应于正概率。
-            adv_loss = -torch.log(pred_prob[:, 0, :].mean()) * 0.5
-            dec_loss = decoding_loss(pred_message, message)
-            loudness_loss = tf_loudness_loss(y, y_g_hat) * 200
-            wm_g_loss = loudness_loss + adv_loss + dec_loss
+            if is_watermarked:
+                wm_loss = F.binary_cross_entropy(pred_prob[:, 1], torch.ones_like(pred_prob[:, 1]))
+                dec_loss = decoding_loss(pred_message, message) * 10  # 优化消息解码
+            else:
+                wm_loss = F.binary_cross_entropy(pred_prob[:, 0], torch.ones_like(pred_prob[:, 0]))
+                dec_loss = 0  # 无水印时不计算解码损失
+            loudness_loss = tf_loudness_loss(y, y_g_hat) * 100
+            wm_g_loss = loudness_loss + wm_loss + dec_loss
 
             if steps >= a.freeze_step:
                 loss_gen_all = (
@@ -741,10 +747,10 @@ def train(rank, a, h):
 
                     # watermark
                     sw.add_scalar("training/grad_norm_wmd", grad_norm_wmd, steps)
-                    sw.add_scalar("training/adv_loss", adv_loss, steps)
+                    sw.add_scalar("training/wm_loss", wm_loss, steps)
                     sw.add_scalar("training/dec_loss", dec_loss, steps)
                     sw.add_scalar("training/loudness_loss", loudness_loss, steps)
-                    # sw.add_scalar("training/wm_loss", wm_loss, steps)
+                    sw.add_scalar("training/wm_g_loss", wm_g_loss, steps)
 
                 # Validation
                 if steps % a.validation_interval == 0:
@@ -799,10 +805,10 @@ def main():
     parser.add_argument("--input_wavs_dir", default="D:/dataset/LibriTTS")
     parser.add_argument("--input_mels_dir", default="ft_dataset")
     parser.add_argument(
-        "--input_training_file", default="D:/dataset/LibriTTS/train-10.txt"
+        "--input_training_file", default="D:/dataset/LibriTTS/train-small.txt"
     )
     parser.add_argument(
-        "--input_validation_file", default="D:/dataset/LibriTTS/val-10.txt"
+        "--input_validation_file", default="D:/dataset/LibriTTS/val-full.txt"
     )
     parser.add_argument(
         "--list_input_unseen_wavs_dir",
@@ -812,10 +818,10 @@ def main():
     parser.add_argument(
         "--list_input_unseen_validation_file",
         nargs="+",
-        default=["D:/dataset/LibriTTS/dev-clean-10.txt", "D:/dataset/LibriTTS/dev-other-10.txt"],
+        default=["D:/dataset/LibriTTS/dev-clean.txt", "D:/dataset/LibriTTS/dev-other.txt"],
     )
     parser.add_argument("--checkpoint_path", default="exp/wmgan")
-    parser.add_argument("--config", default="configs/baseline_withUp_24khz_100band.json")
+    parser.add_argument("--config", default="configs/baseline_up512_base_24khz_100band.json")
     parser.add_argument("--training_epochs", default=20, type=int)
     parser.add_argument("--stdout_interval", default=2, type=int)
     parser.add_argument("--checkpoint_interval", default=2, type=int)

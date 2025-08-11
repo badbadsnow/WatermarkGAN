@@ -1,12 +1,9 @@
 {
-    "output_dim": 32,
-    "nbits": 16,
-    "message_p": 0.5,
     "seanet": {
         "activation": "ELU",
             "activation_params": {"alpha": 1.0},
         "causal": false,
-        "channels": 256,
+        "channels": 32,
         "compress": 2,
         "dilation_base": 2,
         "dimension": 128,
@@ -23,6 +20,10 @@
         "residual_kernel_size": 3,
         "true_skip": true
     },
+
+    "output_dim": 32,
+    "nbits": 16,
+    "message_p": 0.5,
     "decoder": {
         "final_activation": null,
         "final_activation_params": null,
@@ -31,7 +32,7 @@
 
     "resblock": "1",
     "num_gpus": 0,
-    "batch_size": 2,
+    "batch_size": 36,
     "learning_rate": 0.0001,
     "adam_b1": 0.8,
     "adam_b2": 0.99,
@@ -67,7 +68,7 @@
     "fmax": 12000,
     "fmax_for_loss": null,
 
-    "num_workers": 4,
+    "num_workers": 6,
 
     "dist_config": {
         "dist_backend": "nccl",

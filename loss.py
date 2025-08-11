@@ -282,7 +282,7 @@ def tf_loudness_loss(original_audio, watermarked_audio,
                      num_bands=10, window_size=2048,
                      overlap_ratio=0.25, sample_rate=44100):
     """
-    时频响度损失 (公式2)
+    时频响度损失
 
     参数:
         original_audio (Tensor): 原始音频 [batch, 1, samples]
